@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Interactive Physics Bézier Rope</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #0f172a; font-family: 'Segoe UI', sans-serif; color: #cbd5e1; }
+        canvas { display: block; }
+        .ui-overlay {
+            position: absolute; top: 20px; left: 20px;
+            background: rgba(15, 23, 42, 0.85);
+            padding: 20px; border-radius: 8px;
+            border: 1px solid #334155;
+            pointer-events: none; /* Let mouse pass through to canvas */
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.5);
+        }
+        h1 { margin: 0 0 10px 0; font-size: 1.2rem; color: #38bdf8; }
+        p { margin: 5px 0; font-size: 0.9rem; }
+        .legend { display: flex; align-items: center; gap: 8px; margin-top: 5px; }
+        .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+    </style>
+</head>
+<body>
+
+<div class="ui-overlay">
+    <h1>Bézier Physics Engine</h1>
+    <p><strong>P0, P3:</strong> Fixed Anchors</p>
+    <p><strong>P1, P2:</strong> Dynamic Physics Bodies</p>
+    <div class="legend"><span class="dot" style="background:#38bdf8"></span> Curve</div>
+    <div class="legend"><span class="dot" style="background:#f43f5e"></span> Tangents (Derivative)</div>
+    <div class="legend"><span class="dot" style="background:#a3e635"></span> Control Points</div>
+    <p style="margin-top: 15px; color: #94a3b8; font-size: 0.8rem;">
+        Move mouse to disturb the rope.<br>
+        Physics: Spring-Damper Model.
+    </p>
+</div>
+
+<canvas id="canvas"></canvas>
+
+<script>
+/**
+ * ==========================================
+ * PART 1: MATH & VECTOR LIBRARY
+ * Manual implementation of vector operations
+ * ==========================================
+ */
+const Vec2 = {
+    create: (x, y) => ({ x, y }),
+    add: (v1, v2) => ({ x: v1.x + v2.x, y: v1.y + v2.y }),
+    sub: (v1, v2) => ({ x: v1.x - v2.x, y: v1.y - v2.y }),
+    scale: (v, s) => ({ x: v.x * s, y: v.y * s }),
+    mag: (v) => Math.sqrt(v.x * v.x + v.y * v.y),
+    normalize: (v) => {
+        const m = Math.sqrt(v.x * v.x + v.y * v.y);
+        return m === 0 ? { x: 0, y: 0 } : { x: v.x / m, y: v.y / m };
+    },
+    dist: (v1, v2) => Math.sqrt(Math.pow(v2.x - v1.x, 2) + Math.pow(v2.y - v1.y, 2))
+};
+
+/**
+ * ==========================================
+ * PART 2: PHYSICS ENGINE
+ * Custom Spring-Damper System
+ * ==========================================
+ */
+class PhysicsNode {
+    constructor(x, y) {
+        this.pos = Vec2.create(x, y);
+        this.vel = Vec2.create(0, 0);
+        this.target = Vec2.create(x, y); // The "home" position the spring pulls toward
+        
+        // Physics Configuration
+        this.mass = 1.0;
+        this.stiffness = 0.08;  // Spring constant (k)
+        this.damping = 0.92;    // Velocity loss factor (friction)
+    }
+
+    update() {
+        // 1. Hooke's Law: F = -k * (position - target)
+        const displacement = Vec2.sub(this.pos, this.target);
+        const springForce = Vec2.scale(displacement, -this.stiffness);
+
+        // 2. Newton's Second Law: F = ma -> a = F/m
+        const acceleration = Vec2.scale(springForce, 1 / this.mass);
+
+        // 3. Integration (Semi-implicit Euler)
+        this.vel = Vec2.add(this.vel, acceleration);
+        this.vel = Vec2.scale(this.vel, this.damping); // Apply damping
+        this.pos = Vec2.add(this.pos, this.vel);
+    }
+}
+
+/**
+ * ==========================================
+ * PART 3: BÉZIER MATH
+ * Cubic formulas and derivatives
+ * ==========================================
+ */
+const Bezier = {
+    // B(t) = (1-t)³P0 + 3(1-t)²tP1 + 3(1-t)t²P2 + t³P3
+    getPoint: (t, p0, p1, p2, p3) => {
+        const mt = 1 - t;
+        const mt2 = mt * mt;
+        const mt3 = mt2 * mt;
+        const t2 = t * t;
+        const t3 = t2 * t;
+
+        const term0 = Vec2.scale(p0, mt3);
+        const term1 = Vec2.scale(p1, 3 * mt2 * t);
+        const term2 = Vec2.scale(p2, 3 * mt * t2);
+        const term3 = Vec2.scale(p3, t3);
+
+        return Vec2.add(Vec2.add(term0, term1), Vec2.add(term2, term3));
+    },
+
+    // B'(t) = 3(1-t)²(P1-P0) + 6(1-t)t(P2-P1) + 3t²(P3-P2)
+    getTangent: (t, p0, p1, p2, p3) => {
+        const mt = 1 - t;
+        const t2 = t * t;
+
+        const term0 = Vec2.scale(Vec2.sub(p1, p0), 3 * mt * mt);
+        const term1 = Vec2.scale(Vec2.sub(p2, p1), 6 * mt * t);
+        const term2 = Vec2.scale(Vec2.sub(p3, p2), 3 * t2);
+
+        const tangent = Vec2.add(Vec2.add(term0, term1), term2);
+        return Vec2.normalize(tangent);
+    }
+};
+
+/**
+ * ==========================================
+ * PART 4: MAIN APP & RENDERING
+ * ==========================================
+ */
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+let width, height;
+
+// State
+const mouse = { x: 0, y: 0 };
+let p0, p3; // Fixed anchors
+let p1, p2; // Dynamic physics points
+
+function resize() {
+    width = canvas.width = window.innerWidth;
+    height = canvas.height = window.innerHeight;
+    
+    // Reset positions on resize
+    const centerY = height * 0.5;
+    const margin = width * 0.15;
+    
+    p0 = Vec2.create(margin, centerY);
+    p3 = Vec2.create(width - margin, centerY);
+    
+    // Initialize physics points at rest positions
+    p1 = new PhysicsNode(width * 0.35, centerY);
+    p2 = new PhysicsNode(width * 0.65, centerY);
+}
+
+function updatePhysics() {
+    // Interactive Logic:
+    // The mouse acts as a magnet that shifts the "target" (rest) position of the control points.
+    // This creates the "puppetry" feel.
+    
+    const centerY = height * 0.5;
+    
+    // Calculate influence based on mouse position relative to screen center
+    const dx = (mouse.x - width/2) * 0.6;
+    const dy = (mouse.y - height/2) * 0.8;
+
+    // Update targets: P1 and P2 want to be at 1/3 and 2/3 of the screen,
+    // plus the offset generated by the mouse.
+    p1.target = Vec2.create((width * 0.35) + dx, centerY + dy);
+    p2.target = Vec2.create((width * 0.65) + dx, centerY + dy);
+
+    p1.update();
+    p2.update();
+}
+
+function draw() {
+    // Clear Screen
+    ctx.fillStyle = '#0f172a';
+    ctx.fillRect(0, 0, width, height);
+
+    // 1. Draw Skeleton (Connection lines)
+    ctx.beginPath();
+    ctx.strokeStyle = '#334155';
+    ctx.setLineDash([5, 5]);
+    ctx.moveTo(p0.x, p0.y);
+    ctx.lineTo(p1.pos.x, p1.pos.y);
+    ctx.lineTo(p2.pos.x, p2.pos.y);
+    ctx.lineTo(p3.x, p3.y);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // 2. Draw Bézier Curve
+    ctx.beginPath();
+    ctx.strokeStyle = '#38bdf8'; // Sky blue
+    ctx.lineWidth = 4;
+    
+    // Start at P0
+    ctx.moveTo(p0.x, p0.y);
+    
+    const steps = 100; // Resolution
+    for (let i = 1; i <= steps; i++) {
+        const t = i / steps;
+        const pt = Bezier.getPoint(t, p0, p1.pos, p2.pos, p3);
+        ctx.lineTo(pt.x, pt.y);
+    }
+    ctx.stroke();
+
+    // 3. Draw Tangents & Decorate Curve
+    // We draw tangents at 10 intervals
+    for (let i = 0; i <= 10; i++) {
+        const t = i / 10;
+        const pt = Bezier.getPoint(t, p0, p1.pos, p2.pos, p3);
+        const tan = Bezier.getTangent(t, p0, p1.pos, p2.pos, p3);
+        
+        // Draw Tangent Vector
+        const tanLen = 25;
+        const end = Vec2.add(pt, Vec2.scale(tan, tanLen));
+        
+        ctx.beginPath();
+        ctx.strokeStyle = '#f43f5e'; // Red
+        ctx.lineWidth = 2;
+        ctx.moveTo(pt.x, pt.y);
+        ctx.lineTo(end.x, end.y);
+        ctx.stroke();
+        
+        // Draw small dot on curve
+        ctx.beginPath();
+        ctx.fillStyle = '#fff';
+        ctx.arc(pt.x, pt.y, 3, 0, Math.PI * 2);
+        ctx.fill();
+    }
+
+    // 4. Draw Control Points (Handles)
+    const drawHandle = (pos, color) => {
+        ctx.beginPath();
+        ctx.fillStyle = color;
+        ctx.arc(pos.x, pos.y, 6, 0, Math.PI * 2);
+        ctx.fill();
+        // Glow effect
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 2;
+        ctx.stroke();
+    };
+
+    drawHandle(p0, '#94a3b8'); // Anchor
+    drawHandle(p3, '#94a3b8'); // Anchor
+    drawHandle(p1.pos, '#a3e635'); // Dynamic
+    drawHandle(p2.pos, '#a3e635'); // Dynamic
+}
+
+function loop() {
+    updatePhysics();
+    draw();
+    requestAnimationFrame(loop);
+}
+
+// Input Handling
+window.addEventListener('mousemove', (e) => {
+    mouse.x = e.clientX;
+    mouse.y = e.clientY;
+});
+
+// Initialization
+window.addEventListener('resize', resize);
+resize();
+loop();
+
+</script>
+</body>
+</html>
